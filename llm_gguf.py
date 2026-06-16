@@ -1,10 +1,15 @@
 import click
 import httpx
 import json
+from typing import Any
 from llama_cpp import Llama
 from llama_cpp import llama_chat_format
+from llama_cpp.llama_speculative import LlamaDraftModel
+import numpy as np
+import numpy.typing as npt
 import llm
 import pathlib
+from pydantic import Field
 
 
 def _ensure_models_dir():
@@ -47,6 +52,7 @@ def register_models(register):
             clip_model_path=clip_model_path,
             chat_handler_class=chat_handler_class,
             n_ctx=info.get("n_ctx", 0),
+            draft_model_path=info.get("draft_model_path"),
         )
         register(model, aliases=aliases)
 
@@ -65,6 +71,32 @@ def register_embedding_models(register):
 
 @llm.hookimpl
 def register_commands(cli):
+    # Wrap prompt and chat commands to support --spec-draft-model / -md options
+    for command_name in ("prompt", "chat"):
+        if command_name in cli.commands:
+            cmd = cli.commands[command_name]
+            if not any(opt.name == "spec_draft_model" for opt in cmd.params):
+                option = click.Option(
+                    ["--spec-draft-model", "-md"],
+                    type=str,
+                    help="Path to a draft model GGUF file for speculative decoding",
+                    default=None,
+                )
+                cmd.params.append(option)
+                
+                # Wrap the callback
+                original_callback = cmd.callback
+                def make_wrapped_callback(orig_cb):
+                    def wrapped(*args, **kwargs):
+                        spec_draft_model = kwargs.pop("spec_draft_model", None)
+                        if spec_draft_model is not None:
+                            options = list(kwargs.get("options") or [])
+                            options.append(("draft_model_path", spec_draft_model))
+                            kwargs["options"] = tuple(options)
+                        return orig_cb(*args, **kwargs)
+                    return wrapped
+                cmd.callback = make_wrapped_callback(original_callback)
+
     @cli.group()
     def gguf():
         "Commands for working with GGUF models"
@@ -129,6 +161,11 @@ def register_commands(cli):
     @click.option("chat_handler_class", "--chat-handler-class", type=str)
     @click.option("n_ctx", "--n-ctx", type=int, default=0)
     @click.option(
+        "draft_model_path",
+        "--draft-model-path",
+        type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+    )
+    @click.option(
         "aliases",
         "-a",
         "--alias",
@@ -136,7 +173,7 @@ def register_commands(cli):
         help="Alias(es) to register the model under",
     )
     def register_model(
-        model_id, filepath, clip_model_path, chat_handler_class, n_ctx, aliases
+        model_id, filepath, clip_model_path, chat_handler_class, n_ctx, draft_model_path, aliases
     ):
         "Register a GGUF model that you have already downloaded with LLM"
         models_file = _ensure_models_file()
@@ -156,6 +193,8 @@ def register_commands(cli):
             info["chat_handler_class"] = chat_handler_class
         if n_ctx:
             info["n_ctx"] = n_ctx
+        if draft_model_path:
+            info["draft_model_path"] = str(pathlib.Path(draft_model_path).resolve())
         models[model_id] = info
         models_file.write_text(json.dumps(models, indent=2))
 
@@ -208,8 +247,72 @@ def register_commands(cli):
         click.echo(json.dumps(models, indent=2))
 
 
+class LlamaGgufDraftModel(LlamaDraftModel):
+    def __init__(
+        self,
+        model_path: str,
+        parent_model_getter,
+        n_ctx: int = 2048,
+        n_gpu_layers: int = 0,
+        num_pred_tokens: int = 10,
+    ):
+        self.model_path = model_path
+        self.parent_model_getter = parent_model_getter
+        self.n_ctx = n_ctx
+        self.n_gpu_layers = n_gpu_layers
+        self.num_pred_tokens = num_pred_tokens
+        self._model = None
+
+    def __call__(
+        self, input_ids: npt.NDArray[np.intc], /, **kwargs: Any
+    ) -> npt.NDArray[np.intc]:
+        if self._model is None:
+            import llama_cpp.llama_cpp as llama_cpp_inner
+            original_llama_context_default_params = llama_cpp_inner.llama_context_default_params
+
+            parent_model = self.parent_model_getter()
+            parent_ctx = parent_model.ctx
+
+            def patched_llama_context_default_params():
+                params = original_llama_context_default_params()
+                params.ctx_other = llama_cpp_inner.llama_context_p(parent_ctx)
+                return params
+
+            llama_cpp_inner.llama_context_default_params = patched_llama_context_default_params
+            try:
+                self._model = Llama(
+                    model_path=self.model_path,
+                    n_ctx=self.n_ctx,
+                    n_gpu_layers=self.n_gpu_layers,
+                    verbose=False,
+                )
+            finally:
+                llama_cpp_inner.llama_context_default_params = original_llama_context_default_params
+
+        generator = self._model.generate(
+            tokens=input_ids.tolist(),
+            temp=0.0,
+            reset=True,
+        )
+        draft_tokens = []
+        for _ in range(self.num_pred_tokens):
+            try:
+                token = next(generator)
+                draft_tokens.append(token)
+            except StopIteration:
+                break
+        generator.close()
+        return np.array(draft_tokens, dtype=np.intc)
+
+
 class GgufChatModel(llm.Model):
     can_stream = True
+
+    class Options(llm.Options):
+        draft_model_path: str | None = Field(
+            default=None,
+            description="Path to a draft model GGUF file for speculative decoding",
+        )
 
     def __init__(
         self,
@@ -218,22 +321,39 @@ class GgufChatModel(llm.Model):
         n_ctx=0,
         clip_model_path=None,
         chat_handler_class=None,
+        draft_model_path=None,
     ):
         self.model_id = model_id
         self.model_path = model_path
         self.clip_model_path = clip_model_path
         self.chat_handler_class = chat_handler_class
         self.n_ctx = n_ctx  # "0 = from model"
+        self.draft_model_path = draft_model_path
         self._model = None
+    def get_model(self, draft_model_path=None):
+        if draft_model_path is not None:
+            actual_draft_path = draft_model_path if draft_model_path != "" else None
+        else:
+            actual_draft_path = self.draft_model_path
+        if self._model is not None:
+            if getattr(self, "_current_draft_model_path", None) != actual_draft_path:
+                self._model = None
 
-    def get_model(self):
         if self._model is None:
+            draft_model = None
+            if actual_draft_path:
+                draft_model = LlamaGgufDraftModel(
+                    actual_draft_path,
+                    parent_model_getter=lambda: self._model,
+                    n_ctx=self.n_ctx,
+                )
             if self.chat_handler_class is None:
                 self._model = Llama(
                     model_path=self.model_path,
                     verbose=False,
                     n_ctx=self.n_ctx,
                     chat_format="chatml-function-calling",
+                    draft_model=draft_model,
                 )
             else:
                 chat_handler_class = getattr(llama_chat_format, self.chat_handler_class)
@@ -244,7 +364,9 @@ class GgufChatModel(llm.Model):
                     chat_handler_class=chat_handler_class(
                         clip_model_path=self.clip_model_path
                     ),
+                    draft_model=draft_model,
                 )
+            self._current_draft_model_path = actual_draft_path
         return self._model
 
     def execute(self, prompt, stream, response, conversation):
@@ -268,8 +390,10 @@ class GgufChatModel(llm.Model):
             messages.append({"role": "system", "content": prompt.system})
         messages.append({"role": "user", "content": prompt.prompt})
 
+        draft_model_path = getattr(prompt.options, "draft_model_path", None)
+
         if not stream:
-            model = self.get_model()
+            model = self.get_model(draft_model_path=draft_model_path)
             completion = model.create_chat_completion(
                 messages=messages,
                 tools=[
@@ -298,7 +422,7 @@ class GgufChatModel(llm.Model):
             return [completion["choices"][0]["text"]]
 
         # Streaming
-        model = self.get_model()
+        model = self.get_model(draft_model_path=draft_model_path)
         completion = model.create_chat_completion(messages=messages, stream=True)
         for chunk in completion:
             choice = chunk["choices"][0]
